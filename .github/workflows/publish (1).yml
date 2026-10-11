@@ -1,0 +1,335 @@
+# ОДИН ФАЙЛ ДЛЯ GITHUB: сохранить как .github/workflows/publish.yml
+# При загрузке в публичный репозиторий сам создаст модуль и релиз.
+name: Publish PF2e RU UI Autofix
+
+on:
+  push:
+    paths:
+      - .github/workflows/publish.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build module manifest and ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import json, os, zipfile
+          root=Path('dist')
+          root.mkdir(exist_ok=True)
+          main_js=r'''
+          /**
+           * PF2e RU UI Autofix — Foundry VTT 14 / PF2e 8.6
+           * Client-side repair for the initialization order of the pf2e-ru interface dictionary.
+           * Does not persist any Actor/Item/Token changes.
+           */
+          const MODULE_ID = "pf2e-ru-ui-autofix";
+          const TRANSLATION_MODULE = "pf2e-ru";
+          
+          let dictionaryPromise = null;
+          let initialized = false;
+          
+          function applicable() {
+            return game.system?.id === "pf2e"
+              && game.i18n?.lang === "ru"
+              && game.modules.get(TRANSLATION_MODULE)?.active === true;
+          }
+          
+          function hasRussianUI() {
+            const ids = [
+              "PF2E.HitPointsHeader",
+              "PF2E.Item.Ancestry.FIELDS.speed.label",
+              "PF2E.SavesFortitude",
+              "PF2E.SavesReflex",
+              "PF2E.SavesWill"
+            ];
+            return ids.every(id => /[\u0400-\u04ff]/u.test(game.i18n.localize(id)));
+          }
+          
+          function translationFiles() {
+            const configured = CONFIG[TRANSLATION_MODULE]?.systemFiles;
+            if (Array.isArray(configured) && configured.length) {
+              return [...new Set(configured.filter(p => typeof p === "string"
+                && p.startsWith(`modules/${TRANSLATION_MODULE}/`)
+                && p.endsWith(".json")))];
+            }
+            // Conservative fallback if pf2e-ru changes how its CONFIG is initialized.
+            const names = game.modules.get(TRANSLATION_MODULE)?.flags?.[TRANSLATION_MODULE]?.pf2e;
+            return Array.isArray(names)
+              ? [...new Set(names)].filter(s => typeof s === "string" && /^[a-z0-9-]+$/i.test(s))
+                .map(s => `modules/${TRANSLATION_MODULE}/data/community/pf2e/${s}.json`)
+              : [];
+          }
+          
+          function countLeaves(node) {
+            if (node === null || typeof node !== "object") return 1;
+            return Object.values(node).reduce((n, val) => n + countLeaves(val), 0);
+          }
+          
+          async function loadDictionary() {
+            if (hasRussianUI()) return { loaded: 0, total: 0, existing: true };
+          
+            const files = translationFiles();
+            if (!files.length) throw new Error("Список файлов перевода pf2e-ru не найден");
+          
+            // Preserve source order: later dictionaries may override earlier keys.
+            const settled = await Promise.allSettled(
+              files.map(file => foundry.utils.fetchJsonWithTimeout(file))
+            );
+            const combined = {};
+            let loaded = 0;
+            const errors = [];
+            for (let i = 0; i < settled.length; i++) {
+              const result = settled[i];
+              if (result.status === "fulfilled" && result.value && typeof result.value === "object") {
+                foundry.utils.mergeObject(combined, result.value, { inplace: true });
+                loaded++;
+              } else {
+                errors.push(`${files[i]}: ${result.reason?.message ?? "Неверный JSON"}`);
+              }
+            }
+            if (!loaded || !combined.PF2E) {
+              throw new Error(`Не удалось загрузить словарь PF2e (${errors.join("; ")})`);
+            }
+            foundry.utils.mergeObject(game.i18n.translations, combined, { inplace: true });
+            if (errors.length) {
+              console.warn(`${MODULE_ID} | Некоторые файлы не загружены:`, errors);
+            }
+            console.info(`${MODULE_ID} | Словарь подключён: ${loaded}/${files.length} файлов, ${countLeaves(combined.PF2E)} строк PF2E`);
+            return { loaded, total: files.length, existing: false, errors };
+          }
+          
+          function ensureDictionary() {
+            if (!dictionaryPromise) dictionaryPromise = loadDictionary();
+            return dictionaryPromise;
+          }
+          
+          function resetActor(actor) {
+            if (!actor || typeof actor.reset !== "function") return false;
+            try {
+              actor.reset(); // Derived data only. No actor.update() and no server write.
+              actor.render?.(false); // Rerender only currently attached applications.
+              return true;
+            } catch (e) {
+              console.warn(`${MODULE_ID} | Не удалось обновить актёра ${actor.name}`, e);
+              return false;
+            }
+          }
+          
+          function resetSyntheticActors() {
+            if (!initialized || !canvas?.ready) return 0;
+            const unique = new Set();
+            for (const token of canvas.tokens?.placeables ?? []) {
+              if (token.document?.actorLink === false && token.actor) unique.add(token.actor);
+            }
+            let count = 0;
+            for (const actor of unique) if (resetActor(actor)) count++;
+            return count;
+          }
+          
+          async function finishInitialization() {
+            await ensureDictionary();
+            if (!hasRussianUI()) {
+              throw new Error("Русские названия интерфейса отсутствуют после загрузки словаря");
+            }
+          
+            let resetCount = 0;
+            const actors = game.actors?.contents ?? [];
+            for (let i = 0; i < actors.length; i++) {
+              if (resetActor(actors[i])) resetCount++;
+              // Yield periodically so large worlds stay responsive.
+              if ((i + 1) % 30 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+            }
+          
+            initialized = true;
+            const tokenCount = resetSyntheticActors();
+            console.info(`${MODULE_ID} | Готово: заново подготовлено ${resetCount} актёров мира и ${tokenCount} несвязанных токенов`);
+          }
+          
+          function reportError(stage, error) {
+            console.error(`${MODULE_ID} | ${stage}:`, error);
+            if (game.user?.isGM) {
+              ui.notifications?.warn(`PF2e RU Autofix: ${stage}. Подробности в консоли (F12).`);
+            }
+          }
+          
+          // i18nInit: start fetching after core translations are available but before setup.
+          // Hooks do not await async handlers; the ready phase explicitly awaits the promise.
+          Hooks.once("i18nInit", () => {
+            if (!applicable()) return;
+            void ensureDictionary().catch(error => reportError("Загрузка перевода", error));
+          });
+          
+          // Runs on every connected client (GM and players), once per page load.
+          Hooks.once("ready", () => {
+            if (!applicable()) return;
+            void finishInitialization().catch(error => reportError("Восстановление карточек", error));
+          });
+          
+          // Newly viewed scenes may contain synthetic (unlinked) actors.
+          Hooks.on("canvasReady", () => {
+            if (applicable()) resetSyntheticActors();
+          });
+          // ConditionManager caches templates separately from the interface dictionary.
+          // Read translated documents through Babele, preserving all PF2e mechanics.
+          let conditionTexts = new Map();
+          let conditionRefresh = Promise.resolve();
+          let conditionGetterInstalled = false;
+          let babeleConditionHookSeen = false;
+          
+          function installConditionGetter() {
+            if (conditionGetterInstalled) return;
+            const manager = game.pf2e?.ConditionManager;
+            if (typeof manager?.getCondition !== "function") {
+              throw new Error("ConditionManager.getCondition недоступен");
+            }
+            const original = manager.getCondition;
+            manager.getCondition = function (...args) {
+              const translate = condition => {
+                if (!condition) return condition;
+                const text = conditionTexts.get(condition.slug ?? condition.system?.slug);
+                if (!text) return condition;
+                // getCondition returns an unowned template/clone. Never touch an Actor item.
+                if (condition.parent) return condition;
+                if (typeof condition.updateSource !== "function") {
+                  throw new Error("Шаблон состояния не поддерживает updateSource");
+                }
+                condition.updateSource({
+                  name: text.name,
+                  "system.description.value": text.description
+                });
+                return condition;
+              };
+              const result = original.apply(this, args);
+              return result && typeof result.then === "function"
+                ? result.then(translate)
+                : translate(result);
+            };
+            conditionGetterInstalled = true;
+          }
+          
+          async function refreshConditionTexts() {
+            if (!applicable()) return { skipped: true };
+            const pack = game.packs.get("pf2e.conditionitems");
+            if (!pack) throw new Error("Компендиум pf2e.conditionitems не найден");
+            const documents = await pack.getDocuments();
+            const next = new Map();
+            for (const item of documents) {
+              const slug = item.slug ?? item.system?.slug;
+              const description = item.system?.description?.value;
+              if (item.type !== "condition" || !slug || typeof description !== "string") continue;
+              next.set(slug, { name: item.name, description });
+            }
+            // Do not replace a good translation map with documents read before Babele is ready.
+            const blinded = next.get("blinded");
+            if (!blinded || !/[\u0400-\u04ff]/u.test(blinded.name)
+                || !/[\u0400-\u04ff]/u.test(blinded.description)) {
+              throw new Error("Babele ещё не отдаёт русский перевод состояний");
+            }
+            const previous = conditionTexts;
+            conditionTexts = next;
+            try {
+              installConditionGetter();
+              const check = await game.pf2e.ConditionManager.getCondition("blinded");
+              if (check?.name !== blinded.name
+                  || check?.system?.description?.value !== blinded.description) {
+                throw new Error("Проверка перевода шаблона Слепоты не прошла");
+              }
+            } catch (error) {
+              conditionTexts = previous;
+              throw error;
+            }
+            console.info(`${MODULE_ID} | Перевод состояний подключён: ${next.size} шаблонов; Слепота — название и описание проверены`);
+            return { count: next.size, verified: true };
+          }
+          
+          function queueConditionRefresh() {
+            const task = conditionRefresh.catch(() => {}).then(refreshConditionTexts);
+            conditionRefresh = task;
+            return task;
+          }
+          
+          async function initializeConditions() {
+            let lastError;
+            // Hooks are asynchronous and are not awaited by Foundry. Retry a bounded number
+            // of times; babele.ready also triggers a refresh if translation arrives later.
+            for (let attempt = 0; attempt < 6; attempt++) {
+              if (attempt) await new Promise(resolve => setTimeout(resolve, 1000));
+              try { return await queueConditionRefresh(); }
+              catch (error) { lastError = error; }
+            }
+            throw lastError;
+          }
+          
+          Hooks.on("babele.ready", () => {
+            babeleConditionHookSeen = true;
+            if (!game.ready || !applicable()) return;
+            void queueConditionRefresh().catch(error => reportError("Перевод состояний после Babele", error));
+          });
+          
+          Hooks.once("ready", () => {
+            if (!applicable()) return;
+            const mod = game.modules.get(MODULE_ID);
+            if (mod) {
+              mod.api = {
+                ...(mod.api ?? {}),
+                refreshConditions: queueConditionRefresh,
+                conditionStatus: () => ({
+                  translatedTemplates: conditionTexts.size,
+                  getterInstalled: conditionGetterInstalled,
+                  babeleReadyHookSeen: babeleConditionHookSeen
+                })
+              };
+            }
+            void initializeConditions().catch(error => reportError("Восстановление состояний", error));
+          });
+          '''.lstrip('\n')
+          (root/'main.js').write_text(main_js, encoding='utf-8')
+          repo=os.environ['GITHUB_REPOSITORY']
+          ver='0.1.1'
+          module_id='pf2e-ru-ui-autofix'
+          base=f'https://github.com/{repo}/releases'
+          manifest={
+              'id': module_id,
+              'title': 'PF2e RU — исправление интерфейса (Foundry 14)',
+              'description': 'Восстанавливает русский интерфейс PF2e и названия/описания шаблонов состояний после загрузки Babele. Без записи в базу.',
+              'version': ver,
+              'authors': [{'name': 'Community / ChatGPT-generated'}],
+              'compatibility': {'minimum': '14', 'verified': '14.368', 'maximum': '14'},
+              'relationships': {
+                  'systems': [{'id':'pf2e','type':'system','compatibility': {'minimum':'8.6.0','verified':'8.6.0'}}],
+                  'requires': [{'id':'pf2e-ru','type':'module','manifest':'https://gitlab.com/gnuraco/pf2r/-/releases/permalink/latest/downloads/module.json'}, {'id':'babele','type':'module'}]
+              },
+              'esmodules': ['main.js'],
+              'manifest': f'{base}/latest/download/module.json',
+              'download': f'{base}/download/v{ver}/{module_id}.zip',
+              'url': f'https://github.com/{repo}'
+          }
+          (root/'module.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2)+'\n',encoding='utf8')
+          with zipfile.ZipFile(root/f'{module_id}.zip','w',compression=zipfile.ZIP_DEFLATED) as z:
+              z.write(root/'module.json','module.json')
+              z.write(root/'main.js','main.js')
+          print(f"Built {module_id} for {repo} — v{ver}")
+          PYTHON
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view v0.1.1 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload v0.1.1 dist/module.json dist/pf2e-ru-ui-autofix.zip --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create v0.1.1 dist/module.json dist/pf2e-ru-ui-autofix.zip \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "PF2e RU UI Autofix v0.1.1" \
+              --notes "Foundry VTT 14.368 / PF2e 8.6.0: Russian UI and translated condition names/descriptions from Babele. No database changes." \
+              --latest
+          fi
